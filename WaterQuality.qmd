@@ -1,0 +1,777 @@
+---
+title: "Water Quality Analysis: Assessing WRC Effluent Impact on River Health"
+author: "Barnaby Jarvis"
+date: "25/03/26"
+format:
+  pdf:
+    number-sections: true
+    fig-width: 7
+    fig-height: 4
+    fig-pos: "H"
+    fontsize: 11pt
+    include-in-header:
+      text: |
+        \usepackage{fvextra}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(lubridate)
+library(Hmisc)
+library(broom)
+
+theme_set(theme_minimal() + theme(axis.line = element_line(color = "black")))
+```
+
+------------------------------------------------------------------------
+
+# Import Data
+
+## Table import
+
+```{r}
+
+path <- "data/Data_science_placement_student_data_2026.xlsx"
+
+# Sondes
+upstream_raw <- read_xlsx(path, sheet = "Upstream_sonde")
+
+downstream_raw <- read_xlsx(path, sheet = "Downstream_sonde")
+
+# WRC flow
+wrc_flow_raw <- read_xlsx(path, sheet = "WRC_flow")
+
+# River flow
+river_flow_raw <- read_xlsx(path, sheet = "River_flow")
+
+# Effluent spot samples
+effluent_raw <- read_xlsx(path, sheet = "Final effluent - spot samples")
+```
+
+## Data Inventory
+
+```{r}
+sheets <- list(
+  "Upstream sonde" = upstream_raw,
+  "Downstream sonde" = downstream_raw,
+  "WRC Flow" = wrc_flow_raw,
+  "River Flow" = river_flow_raw,
+  "Effluent/flow" = effluent_raw
+  )
+
+inventory <- map_dfr(sheets, \(df) data.frame(
+  Rows       = nrow(df),
+  Cols       = ncol(df),
+  Variables  = paste(names(df), collapse = ", ")
+  ),
+  .id = "Sheet")
+
+inventory %>%
+  kable(col.names = c("Sheet", "Rows", "Cols", "Variables"), caption = "Data inventory") |>
+  kableExtra::kable_styling(position = "center") %>%
+  kableExtra::column_spec(4, width = "10cm")
+```
+
+------------------------------------------------------------------------
+
+# Clean and Standardise
+
+## Fix Column Names
+
+```{r}
+
+upstream <- upstream_raw %>%
+  rename(
+    temp = "TEMPERATURE (°C)",
+    cond = "CONDUCTIVITY (μS/cm)",
+    ph = "PH",
+    ammonium = "AMMONIUM (mg/l)",
+    turbidity = "TURBIDITY (FNU)",
+    do = "DISSOLVED OXYGEN PERCENTAGE(%)"
+  )
+
+downstream <- downstream_raw %>%
+  rename(
+    temp = "TEMPERATURE (°C)",
+    cond = "CONDUCTIVITY (μS/cm)",
+    ph = "PH",
+    ammonium = "AMMONIUM (mg/l)",
+    turbidity = "TURBIDITY (FNU)",
+    do = "DISSOLVED OXYGEN PERCENTAGE(%)"
+  )
+
+wrc_flow <- wrc_flow_raw %>%
+  rename(wrc_flow = "WRC flow (l/s)")
+
+river_flow <- river_flow_raw %>%
+  rename(river_flow = "River flow (m3/s)", quality = "data.quality")
+
+effluent <- effluent_raw %>%
+  rename(
+    determinand = "Determinand long name",
+    qualifier = "Qualifier...4",
+    result = Result,
+    units = Units
+  )
+```
+
+## Add Derived Columns
+
+```{r}
+
+# Create single datetime column
+upstream <- upstream %>%
+  mutate(datetime = dmy(DATE..GMT.) + hm(TIME..GMT.), location = "Upstream") %>%
+  select(datetime, temp, cond, ph, ammonium, turbidity, do, location) %>%
+  filter(!(datetime %within% interval(dmy("22092025"), dmy("29092025"))))
+
+downstream <- downstream %>%
+  mutate(datetime = dmy(DATE..GMT.) + hm(TIME..GMT.), location = "Downstream") %>%
+  select(datetime, temp, cond, ph, ammonium, turbidity, do, location)
+
+wrc_flow <- wrc_flow %>%
+  mutate(datetime = dmy(date) + hms(time), wrc_flow = wrc_flow / 1000) %>%
+  select(datetime, wrc_flow)
+  
+river_flow <- river_flow %>%
+  mutate(datetime = ymd(date) + hms(time)) %>%
+  select(datetime, river_flow, quality)
+
+effluent <- effluent %>%
+  mutate(datetime = ymd(date) + hms(time)) %>%
+  select(datetime, determinand, qualifier, result, units)
+```
+
+## Combine Sonde Data
+
+```{r}
+
+sondes <- bind_rows(upstream, downstream) %>%
+  select(datetime, location, temp, cond, ph, ammonium, turbidity, do)
+
+```
+
+------------------------------------------------------------------------
+
+# Data Quality Checks
+
+## Missing Values
+
+```{r}
+missing_summary_sondes <- sondes %>%
+  group_by(location) %>%
+  summarise(across(everything(), ~ sum(is.na(.))), n = n()) %>%
+  pivot_longer(-c(location, n), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Prop = (Missing_Count / n) * 100)
+
+missing_summary_sondes %>%
+  kable(caption = "Missing summary for each Variable") %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+```
+
+## Out-of-Range Values
+
+```{r}
+thresholds <- list(
+  ph = c(0, 14),
+  ammonium = c(0, 200),
+  do = c(0, 500),
+  temp = c(-5, 50),
+  cond = c(0, 200000),
+  turbidity = c(0, 4000)
+)
+
+out_of_range <- sondes %>%
+  group_by(location) %>%
+  summarise(across(names(thresholds), 
+                   ~ sum(. < thresholds[[cur_column()]][1] | 
+                         . > thresholds[[cur_column()]][2], na.rm = TRUE),
+    .names = "{.col}_out_of_range")) %>%
+  pivot_longer(-location, 
+               names_to = "Variable", 
+               values_to = "Out_of_Range_Count") %>%
+  mutate(Variable = str_remove(Variable, "_out_of_range"))
+
+out_of_range %>%
+  kable(caption = "Out of Range count for each Variable by Location") %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+```
+
+## Remove invalid dates and poor quality samples
+
+```{r}
+out_of_water_dates = interval(dmy("22092025"), dmy("29092025"))
+calibration_dates <- as.POSIXct(c(dmy("02072025"), dmy("08082025"), dmy("11092025"), dmy("13102025")))
+
+sondes <- sondes %>%
+  filter(
+    !(location == "Upstream" & datetime %within% out_of_water_dates) &
+    !(as.Date(datetime) %in% as.Date(calibration_dates))
+  )
+
+river_flow <- river_flow %>%
+  filter(quality == "Good") %>%
+  select(datetime, river_flow)
+```
+
+## Univariate Summary Statistics
+
+```{r}
+summary_table <- sondes %>% 
+  group_by(location) %>%
+  summarise(across(where(is.numeric), 
+                   list(mean = \(x) mean(x, na.rm = TRUE), 
+                        sd   = \(x) sd(x, na.rm = TRUE),
+                        min  = \(x) min(x, na.rm = TRUE),
+                        max  = \(x) max(x, na.rm = TRUE)
+                        )
+                   ),
+            .groups = "drop_last"
+            ) %>%
+  pivot_longer(-location, names_to = "Variable", values_to = "value") %>%
+  pivot_wider(names_from = location, values_from = value) %>%
+  mutate(Difference = Downstream - Upstream)
+
+summary_table %>%
+  kable(digits = 2, caption = "Sondes Statistics Summary") %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+```
+
+## Removing anomolous turbidity values
+
+```{r}
+
+sondes <- sondes %>%
+  mutate(turbidity = case_when(turbidity > 100 ~ NA_real_, TRUE ~ turbidity))
+
+```
+
+Turbidity spikes do not appear to correspond with change in river or WRC flow, and do not match the recordings immediately around them, thus appearing to be anomalous.
+
+------------------------------------------------------------------------
+
+# Parameter Investigation
+
+## Time series plots
+
+```{r}
+
+sondes %>%
+  pivot_longer(c(temp, cond, ph, ammonium, turbidity, do), 
+               names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = recode(parameter,
+    temp = "Temperature (°C)", cond = "Conductivity (μS/cm)",
+    ph = "pH", ammonium = "Ammonium (mg/L)", turbidity = "Turbidity (FNU)", 
+    do = "Dissolved Oxygen (%)")) %>%
+  ggplot(aes(x = datetime, y = value, colour = location)) +
+  geom_point(alpha = 0.15, size = 0.4) +
+  geom_smooth(se = FALSE, method = "loess") +
+  facet_wrap(~parameter, scales = "free_y", ncol = 2, axes = "all") +
+  labs(x = NULL, y = NULL, title = "Sonde Parameters over Time")
+```
+
+Ammonium - upstream and downstream follow similar trends, ruling out the WRC as the sole source of ammonium, divergence at the end of September
+
+Conductivity - Both follow very similar patterns suggesting the WRC is not a factor for changing conductivity. Note drop in September upstream vs downstream.
+
+Dissolved Oxygen - upstream sits consistently higher than downstream across the entire study period. Both show a declining trend going from July to September as oxygen solubility decreases with temperature in the summer.
+
+pH - upstream sits higher than downstream throughout the whole period, but rises noticeably in September - possibly reflecting reduced photosynthetic activity downstream, which would imply a lower DO.
+
+Temperature - both sites track very closely, being slightly lower upstream, but decreasing over time as the seasons change.
+
+Turbidity - both sites are near zero, with a couple spikes which may correspond with a storm or similar.
+
+Note the divergence at the end of September, worth investigating.
+
+## Distributions and Spread
+
+```{r}
+
+sondes %>%
+  pivot_longer(c(temp, cond, ph, ammonium, turbidity, do), 
+               names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = recode(parameter,
+    temp = "Temperature (°C)", cond = "Conductivity (μS/cm)",
+    ph = "pH", ammonium = "Ammonium (mg/L)", turbidity = "Turbidity (FNU)", 
+    do = "Dissolved Oxygen (%)")) %>%
+  ggplot(aes(x = location, y = value, colour = location)) +
+  stat_boxplot(geom = "errorbar") +
+  geom_boxplot() +
+  facet_wrap(~parameter, scales = "free_y", ncol = 3, axes = "all") +
+  scale_y_continuous() +
+  labs(y = NULL, title = "Sonde Parameters Distributions") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+       )
+
+```
+
+## Correlation Matrix
+
+```{r}
+
+get_lower_tri <- function(cormat){
+  cormat[upper.tri(cormat)] <- NA
+  return(cormat)
+}
+
+upstream_matrix <- upstream %>%
+  select_if(is.numeric) %>%
+  as.matrix()
+
+cor_result_upstream <- rcorr(upstream_matrix, type = "spearman")
+
+cor_upstream <- get_lower_tri(cor_result_upstream$r) %>%
+  as.data.frame.table(responseName = "correlation")
+
+p_upstream <- get_lower_tri(cor_result_upstream$P) %>%
+  as.data.frame.table(responseName = "p_value")
+
+cor_upstream <- cor_upstream %>%
+  left_join(p_upstream, by = c("Var1", "Var2")) %>%
+  mutate(
+    location = "Upstream",
+    significance = case_when(
+      is.na(p_value) ~ "",
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*",
+      TRUE ~ ""
+    ))
+
+downstream_matrix <- downstream %>%
+  select_if(is.numeric) %>%
+  as.matrix()
+
+cor_result_downstream <- rcorr(downstream_matrix, type = "spearman")
+
+cor_downstream <- get_lower_tri(cor_result_downstream$r) %>%
+  as.data.frame.table(responseName = "correlation")
+
+p_downstream <- get_lower_tri(cor_result_downstream$P) %>%
+  as.data.frame.table(responseName = "p_value")
+
+cor_downstream <- cor_downstream %>%
+  left_join(p_downstream, by = c("Var1", "Var2")) %>%
+  mutate(
+    location = "Downstream",
+    significance = case_when(
+      is.na(p_value) ~ "",
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*",
+      TRUE ~ ""
+    ))
+
+# Combine
+cor_data <- bind_rows(cor_upstream, cor_downstream)
+
+cor_data %>%
+  ggplot(aes(x = Var1, y = Var2, fill = correlation)) +
+  geom_tile(color = "white") +
+  geom_text(data = . %>% filter(!is.na(correlation)),
+            aes(label = paste0(round(correlation, 2), "\n", significance)), 
+            size = 3) +
+  facet_wrap(~location) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", na.value = "white",
+                       midpoint = 0, limits = c(-1, 1), space = "Lab",
+                       name = "Spearman\nCorrelation") +
+  labs(x = NULL, y = NULL, title = "Spearman Correlation Matrix with Significance") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8))
+
+```
+
+Most variable relationships do not appear to have very high correlation. Notably, pH and dissolved oxygen (%) have the strongest correlation both upstream and downstream, being stronger downstream, as well as pH having a distinctly higher correlation with ammonium upstream compared to downstream, possibly suggesting that WRC effluent decreases the impact of ammonium on pH as it dilutes it with substances further from neutral pH.
+
+Nearly all parameters have statistically significant correlation, however, this does not necessarily translate into practical significance.
+
+------------------------------------------------------------------------
+
+# Upstream vs Downstream Dissolved Oxygen (%) Difference
+
+## Daily Cycle Analysis
+
+```{r}
+
+sondes_daily <- sondes %>%
+  mutate(hour = hour(datetime)) %>%
+  group_by(location, hour) %>%
+  summarise(do_mean = mean(do, na.rm = TRUE), .groups = "drop")
+
+ sondes_daily %>%
+  ggplot(aes(x = hour, y = do_mean, colour = location)) +
+  geom_line() + 
+  geom_point() +
+  labs(x = "Hour of Day", y = "Mean Dissolved Oxygen (%)", title = "Daily Mean DO Cycle")
+ 
+```
+
+The day cycle of the mean dissolved oxygen tracks with natural river ecosystem cycles, where photosynthesis causes a rise in oxygen during the day, and a decrease during the night. The mean dissolved oxygen percentage for each hour of the day is noticeably lower downstream than upstream, but still follows the daily cycle, with slightly earlier peaks and troughs, occurring around an hour earlier. This suggests that something at the WRC plant could potentially be affecting the oxygen concentration, and hence negatively effecting river health.
+
+## Dissolved Oxygen (%) Difference
+
+```{r}
+
+do_difference <- sondes %>%
+  select(datetime, location, do) %>%
+  pivot_wider(names_from = location, values_from = do) %>%
+  mutate(do_diff = Upstream - Downstream)
+
+```
+
+## Dissolved Oxygen (%) Difference Over Time
+
+```{r}
+
+do_difference %>%
+  ggplot(aes(x = datetime, y = do_diff)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(se = FALSE, method = "loess") +
+  geom_hline(yintercept = 0, colour = "red") +
+  labs(title = "Dissolved Oxygen Difference Over Time",
+       x = "Datetime", y = "Dissolved Oxygen Difference (%)")
+
+```
+
+## Dissolved Oxygen (%) Difference significance test
+
+```{r}
+
+t.test(do_difference$do_diff, mu = 0) %>%
+  report::report() %>%
+  as.data.frame() %>%
+  select("Parameter", "Mean", "mu", "t", "p", "CI_low", "CI_high") %>%
+  kable() %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+```
+
+The difference upstream and downstream is definitely significant, with the 95% confidence interval nowhere near 0. Noted, the samples are not independent so a t-test is not necessarily valid, but a good initial exploration.
+
+------------------------------------------------------------------------
+
+# Significant Parameter Investigations against Dissolved Oxygen (%)
+
+## Ammonium
+
+```{r}
+
+sondes %>%
+  group_by(location) %>%
+  ggplot(aes(x = ammonium, y = do, colour = location)) +
+  geom_point(alpha = 0.3) +
+  labs(x = "Ammonium (mg/l)", y = "Dissolved Oxygen (%)",
+       title = "Ammonium vs Dissolved Oxygen by Location")
+
+```
+
+There doesn't appear to be a correlation between dissolved oxygen and ammonium levels, instead clustering around a similar range of values. Downstream noticeably has many 0 readings , while upstream there is a similar vertical line near 0 where lots of points are present, independent of the dissolved oxygen. However, the overlap is significant, so most likely not a clear link between ammonium and Dissolved Oxygen (%).
+
+## pH
+
+```{r}
+
+sondes %>%
+  group_by(location) %>%
+  ggplot(aes(x = ph, y = do, colour = location)) +
+  geom_point(alpha = 0.3) +
+  labs(x = "pH", y = "Dissolved Oxygen (%)",
+       title = "pH vs Dissolved Oxygen by Location")
+
+```
+
+Clear separate clusters for upstream and downstream, with the downstream cluster having a noticeably lower pH compared to upstream. This however just shows that pH is higher upstream than downstream, but doesn't necessarily show that dissolved oxygen (%) necessarily follows the same trend as pH.
+
+## pH location significance test
+
+```{r}
+
+ph_daily <- sondes %>%
+  mutate(date = as.Date(datetime)) %>%
+  group_by(date, location) %>%
+  summarise(daily_mean_ph = mean(ph, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from = location,
+    values_from = daily_mean_ph
+  ) %>%
+  filter(!is.na(Upstream) & !is.na(Downstream))
+
+t.test(ph_daily$Upstream, ph_daily$Downstream, paired = TRUE) %>%
+  report::report() %>%
+  as.data.frame() %>%
+  select("Parameter", "Group", "Difference", "t", "p", "CI_low", "CI_high") %>%
+  kable() %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+```
+
+Although the samples are not dependent due to the time series nature of the data, a basic t-test clearly shows that the difference in pH upstream and downstream is significant. The confidence interval didn’t cross zero, so this appears to be a consistent effect rather than random variation.
+
+## pH and Dissolved Oxygen (%) Daily Cycles (September)
+
+```{r}
+
+sondes %>%
+  mutate(hour = hour(datetime)) %>%
+  group_by(location, hour) %>%
+  summarise(
+    mean_do = mean(do,  na.rm = TRUE),
+    mean_ph = mean(ph,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(c(mean_do, mean_ph), 
+               names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = recode(parameter,
+    mean_do = "Dissolved Oxygen (%)",
+    mean_ph = "pH")) %>%
+  ggplot(aes(x = hour, y = value, colour = location)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~parameter, scales = "free_y", ncol = 1, axes = "all") +
+  labs(title = "September Daily Cycles — Dissolved Oxygen (%) and pH",
+       x = "Hour of Day", y = NULL)
+```
+
+pH and dissolved oxygen (%) do tent to follow a similar daily trend, however, the trend for dissolved oxygen is significantly more pronounced than that of pH
+
+------------------------------------------------------------------------
+
+# River and WRC Flow Effect
+
+## WRC vs River Flow
+
+```{r}
+
+wrc_river_flow <- wrc_flow %>%
+  left_join(river_flow, by = "datetime") %>%
+  pivot_longer(-datetime, names_to = "source", values_to = "flow") %>%
+  mutate(source = recode(source, wrc_flow = "WRC Flow (m^3/s)", river_flow = "River Flow (m^3/s)"))
+
+wrc_river_flow %>%
+  ggplot(aes(x = datetime, y = flow, colour = source)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE) +
+  facet_wrap(~source, scales = "free_y", ncol = 1, axes = "all") +
+  labs(x = NULL, y = "Flow", title = "Daily Mean Flow over Time", colour = NULL)
+
+```
+
+Average trend for river and WRC flow are similar, however, all spikes in river flow correspond with a spike in WRC flow, but this implication does not necessarily apply in reverse. It can also be noted that because of the spiky nature of the line plot for WRC, it might imply that it follows a daily cycle of when peak release is.
+
+## Daily WRC and River Flow Cycles
+
+```{r}
+
+wrc_river_flow %>%
+  mutate(hour = hour(datetime)) %>%
+  group_by(hour, source) %>%
+  summarise(flow_mean = mean(flow, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = hour, y = flow_mean, colour = source)) +
+  geom_line() + 
+  geom_point() +
+  labs(x = "Hour of Day", y = "Mean Flow (m^3/s)",
+       title = "Daily Mean WRC and River Flow Cycle")
+
+```
+
+The graph shows that the WRC flow is significantly higher during the day, dropping off significantly in the evening. River flow however appears consistent throughout the day and night.
+
+## Dissolve Oxygen compared to WRC Flow
+
+```{r}
+
+do_difference %>%
+  left_join(river_flow, by = "datetime") %>%
+  ggplot(aes(x = river_flow, y = do_diff)) +
+  geom_point(alpha = 0.2, size = 0.4) +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, colour = "red") +
+  labs(title = "River Flow vs Dissolved Oxygen Difference (%)",
+       x = "River Flow",
+       y = "Dissolved Oxygen Difference (%)")
+
+do_difference %>%
+  left_join(wrc_flow, by = "datetime") %>%
+  ggplot(aes(x = wrc_flow, y = do_diff)) +
+  geom_point(alpha = 0.2, size = 0.4) +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, colour = "red") +
+  labs(title = "WRC Flow vs Dissolved Oxygen Difference (%)",
+       x = "River Flow",
+       y = "Dissolved Oxygen Difference (%)")
+
+```
+
+Lower flow through the WRC appears to have a bigger difference between the dissolve oxygen (%) probably because at lower flow the effluent is at a higher concentration. This is shown by the negative, although weak, correlation (-0.3285013).
+
+## Summarise by Flow Conditions
+
+```{r}
+
+do_difference %>%
+  left_join(river_flow, by = "datetime") %>%
+  mutate(flow_band = case_when(
+    river_flow <= quantile(river_flow, 0.33, na.rm = TRUE) ~ "Low Flow",
+    river_flow <= quantile(river_flow, 0.66, na.rm = TRUE) ~ "Medium Flow",
+    river_flow >  quantile(river_flow, 0.66, na.rm = TRUE) ~ "High Flow"
+  )) %>%
+  group_by(flow_band) %>%
+  summarise(
+    mean_diff = mean(do_diff, na.rm = TRUE),
+    median_diff = median(do_diff, na.rm = TRUE),
+    sd_diff = sd(do_diff, na.rm = TRUE),
+    count = n()
+  ) %>%
+    kable(caption = "Dissolved Oxygen Difference (\\%) by River Flow Band") %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+do_difference %>%
+  left_join(wrc_flow, by = "datetime") %>%
+  mutate(effluent_band = case_when(
+    wrc_flow <= quantile(wrc_flow, 0.33, na.rm = TRUE) ~ "Low Effluent",
+    wrc_flow <= quantile(wrc_flow, 0.66, na.rm = TRUE) ~ "Medium Effluent",
+    wrc_flow >  quantile(wrc_flow, 0.66, na.rm = TRUE) ~ "High Effluent"
+  )) %>%
+  group_by(effluent_band) %>%
+  summarise(
+    mean_diff = mean(do_diff, na.rm = TRUE),
+    median_diff = median(do_diff, na.rm = TRUE),
+    sd_diff = sd(do_diff, na.rm = TRUE),
+    count = n()
+  ) %>%
+    kable(caption = "Dissolved Oxygen Difference (\\%) by WRC Flow Band") %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+```
+
+For both river flow and WRC flow, at lower flow, the difference between upstream and downstream dissolved oxygen (%) is on average higher
+
+## WRC Flow effect on pH
+
+```{r}
+
+ph_difference <- sondes %>%
+  select(datetime, location, ph) %>%
+  pivot_wider(names_from = location, values_from = ph) %>%
+  mutate(ph_diff = Upstream - Downstream)
+
+ph_difference %>%
+  left_join(wrc_flow, by = "datetime") %>%
+  ggplot(aes(x = wrc_flow, y = ph_diff)) +
+  geom_point(alpha = 0.2, size = 0.4) +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, colour = "red") +
+  labs(title = "WRC Flow vs pH Difference",
+       x = "WRC Flow (m^3/s)",
+       y = "pH Difference")
+
+```
+
+Not much of a relationship between the pH difference and the WRC flow, appearing to stay stable, with a slight drop off at high flow. This suggests the difference is most like not due to WRC effluent release.
+
+------------------------------------------------------------------------
+
+# Effluent Investigation
+
+## Effluent Summary
+
+```{r}
+
+effluent %>%
+  group_by(determinand) %>%
+  summarise(
+    n_samples = n(),
+    date_from = as.Date(min(datetime, na.rm = TRUE)),
+    date_to = as.Date(max(datetime, na.rm = TRUE))
+  ) %>%
+  arrange(determinand) %>%
+  kable(col.names = c("Determinand", "Samples", "First Sample", "Last Sample"),
+        caption = "Effluent Spot Sample Coverage by Determinand") %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+```
+
+With how few readings for each determinant, joining the effluent data with the 30 minute interval sondes data most likely won't give any meaningful results as the temporal mismatch is too large for any time-series overlay. The weekly nature of the readings mean that most spikes recorded by the sonde won't have a corresponding reading in the effluent data.
+
+------------------------------------------------------------------------
+
+# September Divergence Investigation
+
+## Time Series plots for September
+
+```{r}
+
+sondes %>%
+  filter(month(datetime) == 9) %>%
+  pivot_longer(c(temp, cond, ph, ammonium, turbidity, do), 
+               names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = recode(parameter,
+    temp = "Temperature (°C)", cond = "Conductivity (μS/cm)",
+    ph = "pH", ammonium = "Ammonium (mg/L)", turbidity = "Turbidity (FNU)", 
+    do = "Dissolved Oxygen (%)")) %>%
+  ggplot(aes(x = datetime, y = value, colour = location)) +
+  geom_point(alpha = 0.15, size = 0.4) +
+  geom_smooth(se = FALSE, method = "loess") +
+  facet_wrap(~parameter, scales = "free_y", ncol = 2, axes = "all") +
+  labs(x = NULL, y = NULL, title = "Sonde Parameters over Time (September)")
+
+```
+
+Noticeable divergence at the end of September in conductivity, pH, ammonium, and dissolved oxygen between upstream and downstream. Upstream conditions seem to improve, showing much cleaner water with higher dissolved oxygen (%) and a more alkaline pH, whereas downstream appears to stay more stable throughout the month. Temperature appears to decrease, which makes sense seasonably as autumn begins.
+
+If this was caused by the WRC, we would expect the divergence to be downstream, but since it is not, this is most likely caused by an environmental factor.
+
+Note that September 22 to September 29 the upstream sonde was out of water, so there are no readings between these dates so the predicted trend may not be accurate to the true trend.
+
+## River and WRC Flow in September
+
+```{r}
+
+wrc_river_flow %>%
+  filter(month(datetime) == 9) %>%
+  ggplot(aes(x = datetime, y = flow, colour = source)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE) +
+  facet_wrap(~source, scales = "free_y", ncol = 1, axes = "all") +
+  labs(x = NULL, y = "Flow", title = "Daily Mean Flow over Time", colour = NULL)
+
+```
+
+River and WRC flow does not appear to change by a significant amount for the divergence period, hence supporting the environmental factor reasoning.
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+## Evidence for WRC impact:
+
+The downstream monitoring location records notably lower dissolved oxygen compared to upstream (mean: 58.40% vs 78.08%, p-val \< 0.001). This 20% deficit is both statistically significant and ecologically concerning—downstream dissolved oxygen levels of 58% fall below the healthy range for aquatic ecosystems, indicating potential stress on river life. The difference persists consistently across the entire study period and follows natural diel cycling patterns at both locations, with downstream peaks and troughs occurring slightly ealier compared to upstream.
+
+pH exhibits a similar pattern: downstream values are significantly lower than upstream (mean: 7.30 vs 7.63, p \< 0.001), and pH shows the strongest correlation with dissolved oxygen at both locations (ρ = 0.65 downstream, ρ = 0.52 upstream). The parallel reduction in both DO and pH downstream suggests a common mechanism potentially linked to WRC discharge.
+
+Flow analysis reveals that dissolved oxygen differences are most pronounced during low-flow conditions—when WRC flow is low, and hence effluent concentration high, the mean difference increases to 23.09%, compared to 14.81% during high effluent flow periods. This inverse relationship between WRC flow and DO deficit is consistent with a concentration-dependent effluent impact.
+
+## Evidence against WRC impact:
+
+The September divergence investigation revealed a critical counterpoint. t the end of the study period, water quality improved upstream (higher dissolved oxygen, more alkaline pH) while downstream conditions remained the same. If the WRC were the primary driver of downstream degradation, we would expect changes to appear downstream, not upstream. The fact that upstream conditions improved while WRC and river flows remained stable strongly suggests that environmental factors, rather than treatment plant effluent, caused this divergence.
+
+Additionally, several parameters show no evidence of WRC influence. Conductivity and temperature tracks almost identically at both locations, ammonium concentrations follow similar temporal patterns upstream and downstream, ruling out the WRC as the sole nitrogen source, and turbidity remains near baseline at both sites.
+
+## Interpretation and limitations:
+
+The data suggest the WRC discharge may contribute to reduced dissolved oxygen downstream, but is unlikely to be the only factor. The consistent 20% deficit, its association with low flow (high effluent concentration), and the co-occurring pH trend are consistent with effluent impact. However, the September divergence pattern - where upstream conditions improved independently of the WRC - indicates that environmental may also play a role in the water quality differences between the two locations.
+
+Critically, the effluent spot sampling data (7-15 samples per determinand over 12 weeks) proved too temporally sparse to correlate meaningfully with the high-frequency sonde data. This temporal mismatch prevented direct analysis of effluent composition impacts during specific discharge events, leaving the mechanistic link between WRC operations and downstream DO levels uncertain.
